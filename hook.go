@@ -49,31 +49,21 @@ func WithLogger(logger *slog.Logger) Option {
 	return func(h *Hook[any]) { h.logger = logger }
 }
 
-// WithChannel sets the notification channel name
-func WithChannel(channel string) Option {
-	return func(h *Hook[any]) { h.channel = channel }
-}
-
 // Hook manages PostgreSQL triggers and notifications for table changes
 type Hook[T any] struct {
 	pool     *pgxpool.Pool
 	logger   *slog.Logger
-	channel  string
 	mu       sync.RWMutex
 	handlers []eventHandler[T]
 }
 
 // New creates a new Hook with the given configuration
 func New[T any](pool *pgxpool.Pool, opts ...Option) *Hook[T] {
-	tempHook := &Hook[any]{
-		pool:    pool,
-		logger:  slog.Default(),
-		channel: "pghook",
-	}
+	tempHook := &Hook[any]{pool: pool, logger: slog.Default()}
 	for _, opt := range opts {
 		opt(tempHook)
 	}
-	return &Hook[T]{pool: tempHook.pool, logger: tempHook.logger, channel: tempHook.channel}
+	return &Hook[T]{pool: tempHook.pool, logger: tempHook.logger}
 }
 
 // OnInsert adds a new handler for the INSERT operation on the given table.
@@ -124,7 +114,7 @@ func (h *Hook[T]) Listen(ctx context.Context) error {
 	}
 	defer conn.Release()
 
-	h.logger.Info("listening for notifications...", "channel", h.channel)
+	h.logger.Info("listening for notifications...")
 	for {
 		select {
 		case <-ctx.Done():
@@ -155,11 +145,11 @@ func (h *Hook[T]) setup(ctx context.Context) error {
 		}
 	}
 
-	if _, err := h.pool.Exec(ctx, fmt.Sprintf("LISTEN %s", h.channel)); err != nil {
+	if _, err := h.pool.Exec(ctx, "LISTEN pghook"); err != nil {
 		return fmt.Errorf("failed to listen: %w", err)
 	}
 
-	h.logger.Debug("setup completed", "channel", h.channel, "tables", len(tables))
+	h.logger.Debug("setup completed", "tables", len(tables))
 	return nil
 }
 
@@ -211,8 +201,8 @@ func (h *Hook[T]) handleNotification(ctx context.Context, payloadStr string) {
 }
 
 func (h *Hook[T]) createNotifyFunction(ctx context.Context) error {
-	query := fmt.Sprintf(`
-        CREATE OR REPLACE FUNCTION pghook_notify() RETURNS TRIGGER AS $$
+	query := `
+        CREATE OR REPLACE FUNCTION pghook.notify() RETURNS TRIGGER AS $$
         DECLARE
             payload jsonb;
         BEGIN
@@ -232,30 +222,29 @@ func (h *Hook[T]) createNotifyFunction(ctx context.Context) error {
                 WHEN 'DELETE' THEN
                     payload := payload || jsonb_build_object('row', row_to_json(OLD));
             END CASE;
-            PERFORM pg_notify('%s', payload::text);
+            PERFORM pg_notify('pghook', payload::text);
             RETURN NULL;
         END;
         $$ LANGUAGE plpgsql;
-    `, h.channel)
-
+    `
 	if _, err := h.pool.Exec(ctx, query); err != nil {
 		return fmt.Errorf("create notify function failed: %w", err)
 	}
-	h.logger.Debug("created notify function", "name", "pghook_notify", "channel", h.channel)
+	h.logger.Debug("created notify function", "name", "pghook.notify")
 	return nil
 }
 
 func (h *Hook[T]) createTrigger(ctx context.Context, table string) error {
 	query := fmt.Sprintf(`
-        CREATE OR REPLACE TRIGGER %s_pghook
+        CREATE OR REPLACE TRIGGER pghook_%s
         AFTER INSERT OR UPDATE OR DELETE ON %s
-        FOR EACH ROW EXECUTE PROCEDURE pghook_notify();
+        FOR EACH ROW EXECUTE PROCEDURE pghook.notify();
     `, table, table)
 
 	if _, err := h.pool.Exec(ctx, query); err != nil {
 		return fmt.Errorf("create trigger failed: %w", err)
 	}
 
-	h.logger.Debug("created trigger", "name", fmt.Sprintf("%s_pghook", table), "table", table)
+	h.logger.Debug("created trigger", "name", fmt.Sprintf("pghook_%s", table), "table", table)
 	return nil
 }
