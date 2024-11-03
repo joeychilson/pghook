@@ -8,37 +8,39 @@ import (
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/joeychilson/pghook/migrations"
 )
 
 type eventHandler[T any] struct {
-	table     string
-	operation string
-	handler   func(context.Context, any) error
+	op      string
+	table   string
+	handler func(context.Context, any) error
+}
+
+type baseEvent struct {
+	ID    int    `json:"id"`
+	Op    string `json:"op"`
+	Table string `json:"table"`
 }
 
 // InsertEvent represents an INSERT operation event
 type InsertEvent[T any] struct {
-	Operation string `json:"operation"`
-	Schema    string `json:"schema"`
-	Table     string `json:"table"`
-	Row       T      `json:"row"`
+	baseEvent
+	Row T `json:"row"`
 }
 
 // UpdateEvent represents an UPDATE operation event
 type UpdateEvent[T any] struct {
-	Operation string `json:"operation"`
-	Schema    string `json:"schema"`
-	Table     string `json:"table"`
-	OldRow    T      `json:"old_row"`
-	NewRow    T      `json:"new_row"`
+	baseEvent
+	OldRow T `json:"old_row"`
+	NewRow T `json:"new_row"`
 }
 
 // DeleteEvent represents a DELETE operation event
 type DeleteEvent[T any] struct {
-	Operation string `json:"operation"`
-	Schema    string `json:"schema"`
-	Table     string `json:"table"`
-	Row       T      `json:"row"`
+	baseEvent
+	Row T `json:"row"`
 }
 
 // Option is a function that configures a Hook
@@ -53,8 +55,9 @@ func WithLogger(logger *slog.Logger) Option {
 type Hook[T any] struct {
 	pool     *pgxpool.Pool
 	logger   *slog.Logger
-	mu       sync.RWMutex
+	migrator *migrations.Migrator
 	handlers []eventHandler[T]
+	mu       sync.RWMutex
 }
 
 // New creates a new Hook with the given configuration
@@ -63,7 +66,11 @@ func New[T any](pool *pgxpool.Pool, opts ...Option) *Hook[T] {
 	for _, opt := range opts {
 		opt(tempHook)
 	}
-	return &Hook[T]{pool: tempHook.pool, logger: tempHook.logger}
+	return &Hook[T]{
+		pool:     tempHook.pool,
+		logger:   tempHook.logger,
+		migrator: migrations.NewMigrator(tempHook.pool),
+	}
 }
 
 // OnInsert adds a new handler for the INSERT operation on the given table.
@@ -72,9 +79,9 @@ func (h *Hook[T]) OnInsert(table string, handler func(context.Context, InsertEve
 	defer h.mu.Unlock()
 
 	h.handlers = append(h.handlers, eventHandler[T]{
-		table:     table,
-		operation: "INSERT",
-		handler:   func(ctx context.Context, e any) error { return handler(ctx, e.(InsertEvent[T])) },
+		op:      "INSERT",
+		table:   table,
+		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(InsertEvent[T])) },
 	})
 }
 
@@ -84,9 +91,9 @@ func (h *Hook[T]) OnUpdate(table string, handler func(context.Context, UpdateEve
 	defer h.mu.Unlock()
 
 	h.handlers = append(h.handlers, eventHandler[T]{
-		table:     table,
-		operation: "UPDATE",
-		handler:   func(ctx context.Context, e any) error { return handler(ctx, e.(UpdateEvent[T])) },
+		op:      "UPDATE",
+		table:   table,
+		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(UpdateEvent[T])) },
 	})
 }
 
@@ -96,9 +103,9 @@ func (h *Hook[T]) OnDelete(table string, handler func(context.Context, DeleteEve
 	defer h.mu.Unlock()
 
 	h.handlers = append(h.handlers, eventHandler[T]{
-		table:     table,
-		operation: "DELETE",
-		handler:   func(ctx context.Context, e any) error { return handler(ctx, e.(DeleteEvent[T])) },
+		op:      "DELETE",
+		table:   table,
+		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(DeleteEvent[T])) },
 	})
 }
 
@@ -106,6 +113,10 @@ func (h *Hook[T]) OnDelete(table string, handler func(context.Context, DeleteEve
 func (h *Hook[T]) Listen(ctx context.Context) error {
 	if err := h.setup(ctx); err != nil {
 		return fmt.Errorf("failed to setup hook: %w", err)
+	}
+
+	if err := h.processUnprocessedEvents(ctx); err != nil {
+		return fmt.Errorf("failed to process unprocessed events: %w", err)
 	}
 
 	conn, err := h.pool.Acquire(ctx)
@@ -124,14 +135,14 @@ func (h *Hook[T]) Listen(ctx context.Context) error {
 			if err != nil {
 				return fmt.Errorf("wait for notification failed: %w", err)
 			}
-			go h.handleNotification(ctx, notification.Payload)
+			go h.handleEvent(ctx, eventSource{Payload: notification.Payload, EventID: 0})
 		}
 	}
 }
 
 func (h *Hook[T]) setup(ctx context.Context) error {
-	if err := h.createNotifyFunction(ctx); err != nil {
-		return fmt.Errorf("create notify function failed: %w", err)
+	if err := h.migrator.Migrate(context.Background()); err != nil {
+		return fmt.Errorf("failed to migrate: %w", err)
 	}
 
 	tables := make(map[string]bool)
@@ -153,91 +164,90 @@ func (h *Hook[T]) setup(ctx context.Context) error {
 	return nil
 }
 
-func (h *Hook[T]) handleNotification(ctx context.Context, payloadStr string) {
-	var base struct {
-		Operation string `json:"operation"`
-		Table     string `json:"table"`
+func (h *Hook[T]) processUnprocessedEvents(ctx context.Context) error {
+	rows, err := h.pool.Query(ctx, "SELECT id, payload FROM pghook.events WHERE processed = false ORDER BY id")
+	if err != nil {
+		return fmt.Errorf("failed to query unprocessed events: %w", err)
 	}
-	if err := json.Unmarshal([]byte(payloadStr), &base); err != nil {
-		h.logger.Error("unmarshal notification payload failed", "error", err)
-		return
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			id      int
+			payload []byte
+		)
+		if err := rows.Scan(&id, &payload); err != nil {
+			h.logger.Error("failed to scan event", "error", err)
+			continue
+		}
+
+		if err := h.handleEvent(ctx, eventSource{Payload: string(payload), EventID: id}); err != nil {
+			h.logger.Error("failed to handle unprocessed event", "error", err, "event_id", id)
+		}
+	}
+	return rows.Err()
+}
+
+type eventSource struct {
+	Payload string
+	EventID int
+}
+
+func (h *Hook[T]) handleEvent(ctx context.Context, source eventSource) error {
+	var base baseEvent
+	if err := json.Unmarshal([]byte(source.Payload), &base); err != nil {
+		h.logger.Error("unmarshal payload failed", "error", err)
+		return err
 	}
 
 	var event any
-	switch base.Operation {
+	switch base.Op {
 	case "INSERT":
 		var e InsertEvent[T]
-		if err := json.Unmarshal([]byte(payloadStr), &e); err != nil {
-			h.logger.Error("unmarshal insert payload failed", "error", err)
-			return
+		if err := json.Unmarshal([]byte(source.Payload), &e); err != nil {
+			h.logger.Error("unmarshal insert event failed", "error", err)
+			return err
 		}
 		event = e
 	case "UPDATE":
 		var e UpdateEvent[T]
-		if err := json.Unmarshal([]byte(payloadStr), &e); err != nil {
-			h.logger.Error("unmarshal update payload failed", "error", err)
-			return
+		if err := json.Unmarshal([]byte(source.Payload), &e); err != nil {
+			h.logger.Error("unmarshal update event failed", "error", err)
+			return err
 		}
 		event = e
 	case "DELETE":
 		var e DeleteEvent[T]
-		if err := json.Unmarshal([]byte(payloadStr), &e); err != nil {
-			h.logger.Error("unmarshal delete payload failed", "error", err)
-			return
+		if err := json.Unmarshal([]byte(source.Payload), &e); err != nil {
+			h.logger.Error("unmarshal delete event failed", "error", err)
+			return err
 		}
 		event = e
 	default:
-		h.logger.Debug("unsupported operation", "operation", base.Operation)
-		return
+		h.logger.Debug("unsupported op", "op", base.Op)
+		return nil
 	}
 
 	for _, handler := range h.handlers {
-		if handler.table == base.Table && handler.operation == base.Operation {
+		if handler.table == base.Table && handler.op == base.Op {
 			if err := handler.handler(ctx, event); err != nil {
-				h.logger.Error("handler failed", "table", base.Table, "operation", base.Operation, "error", err)
+				h.logger.Error("handler failed", "table", base.Table, "op", base.Op, "error", err)
 			}
 		}
 	}
-}
 
-func (h *Hook[T]) createNotifyFunction(ctx context.Context) error {
-	query := `
-        CREATE OR REPLACE FUNCTION pghook.notify() RETURNS TRIGGER AS $$
-        DECLARE
-            payload jsonb;
-        BEGIN
-            payload := jsonb_build_object(
-                'operation', TG_OP,
-                'schema', TG_TABLE_SCHEMA,
-                'table', TG_TABLE_NAME
-            );
-            CASE TG_OP
-                WHEN 'INSERT' THEN
-                    payload := payload || jsonb_build_object('row', row_to_json(NEW));
-                WHEN 'UPDATE' THEN
-                    payload := payload || jsonb_build_object(
-                        'old_row', row_to_json(OLD),
-                        'new_row', row_to_json(NEW)
-                    );
-                WHEN 'DELETE' THEN
-                    payload := payload || jsonb_build_object('row', row_to_json(OLD));
-            END CASE;
-            PERFORM pg_notify('pghook', payload::text);
-            RETURN NULL;
-        END;
-        $$ LANGUAGE plpgsql;
-    `
-	if _, err := h.pool.Exec(ctx, query); err != nil {
-		return fmt.Errorf("create notify function failed: %w", err)
+	if source.EventID > 0 {
+		if _, err := h.pool.Exec(ctx, "UPDATE pghook.events SET processed = true WHERE id = $1", source.EventID); err != nil {
+			h.logger.Error("failed to mark event as processed", "event_id", source.EventID, "error", err)
+			return err
+		}
 	}
-	h.logger.Debug("created notify function", "name", "pghook.notify")
 	return nil
 }
 
 func (h *Hook[T]) createTrigger(ctx context.Context, table string) error {
 	query := fmt.Sprintf(`
-        CREATE OR REPLACE TRIGGER pghook_%s
-        AFTER INSERT OR UPDATE OR DELETE ON %s
+        CREATE OR REPLACE TRIGGER pghook_%s AFTER INSERT OR UPDATE OR DELETE ON %s
         FOR EACH ROW EXECUTE PROCEDURE pghook.notify();
     `, table, table)
 
