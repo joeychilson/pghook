@@ -1,4 +1,4 @@
-module github.com/joeychilson/pghooks
+module github.com/joeychilson/pghook
 
 go 1.20
 

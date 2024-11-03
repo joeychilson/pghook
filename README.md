@@ -1,11 +1,11 @@
-# pghooks
+# pghook
 
-A simple PostgreSQL LISTEN/NOTIFY library for Go.
+A Go library for listening to PostgreSQL notifications and executing hooks on insert, update, and delete events.
 
 ## Installation
 
 ```bash
-go get github.com/joeychilson/pghooks
+go get github.com/joeychilson/pghook
 ```
 
 ## Example
@@ -15,50 +15,53 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"os"
+	"time"
 
-	"github.com/joeychilson/pghooks"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/joeychilson/pghook"
 )
-
-type MyHook struct{}
-
-func (h *MyHook) Handle(ctx context.Context, payload pghooks.Payload) {
-	log.Println("MyHook received notification on table", payload.Table)
-	log.Printf("Payload: %+v", payload)
-}
 
 func main() {
 	ctx := context.Background()
 
-	// Create a new hooks instance. Use NewWithPool to use an existing connection pool.
-	h, err := pghooks.New(ctx, "postgres://postgres:postgres@localhost:5432/postgres")
+	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Insert hook for the "users" table.
-	h.InsertHook("users", func(ctx context.Context, payload pghooks.Payload) {
-		log.Println("HandleInsert received INSERT notification on table", payload.Table)
-		log.Printf("Payload: %+v", payload)
+	type User struct {
+		ID        int       `json:"id"`
+		Name      string    `json:"name"`
+		Email     string    `json:"email"`
+		CreatedAt time.Time `json:"created_at"`
+		UpdatedAt time.Time `json:"updated_at"`
+	}
+
+	hook := pghook.New[User](pool)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	hook.OnInsert("users", func(ctx context.Context, e pghook.InsertEvent[User]) error {
+		fmt.Println("inserted", e.Row)
+		return nil
 	})
 
-	// Update hook for the "users" table.
-	h.UpdateHook("users", func(ctx context.Context, payload pghooks.Payload) {
-		log.Println("HandleUpdate received UPDATE notification on table", payload.Table)
-		log.Printf("Payload: %+v", payload)
+	hook.OnUpdate("users", func(ctx context.Context, e pghook.UpdateEvent[User]) error {
+		fmt.Println("updated", e.OldRow, e.NewRow)
+		return nil
 	})
 
-	// Delete hook for the "users" table.
-	h.DeleteHook("users", func(ctx context.Context, payload pghooks.Payload) {
-		log.Println("HandleDelete received DELETE notification on table", payload.Table)
-		log.Printf("Payload: %+v", payload)
+	hook.OnDelete("users", func(ctx context.Context, e pghook.DeleteEvent[User]) error {
+		fmt.Println("deleted", e.Row)
+		return nil
 	})
 
-	// Register the custom handler to handle INSERT operations on the "users" table.
-	h.Hook("users", pghooks.InsertOp, &MyHook{})
-
-	// Start listening for notifications
-	if err := h.Listen(ctx); err != nil {
+	if err := hook.Listen(ctx); err != nil {
 		log.Fatal(err)
 	}
 }
