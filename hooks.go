@@ -8,8 +8,10 @@ import (
 	"log"
 	"sync"
 
-	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+type Op string
 
 const (
 	InsertOp Op = "INSERT"
@@ -17,49 +19,28 @@ const (
 	DeleteOp Op = "DELETE"
 )
 
-type (
-	// Hook is a struct that holds information about a connection pool and the handlers that should be triggered for each table operation.
-	Hook struct {
-		conn     *pgx.Conn
-		handlers map[TableOp][]Handler
-		mu       sync.Mutex
-	}
-
-	// Op is a type alias for string that represents an table operation.
-	Op string
-
-	// TableOp is a struct that holds information about a table and the operation that should be performed on it.
-	TableOp struct {
-		Table string `json:"table"`
-		Op    Op     `json:"op"`
-	}
-
-	// Payload is a struct that holds information about a payload sent from the database.
-	Payload struct {
-		Op     Op             `json:"op"`
-		Schema string         `json:"schema"`
-		Table  string         `json:"table"`
-		Row    map[string]any `json:"row"`
-		OldRow map[string]any `json:"old_row"`
-	}
-)
-
-// New creates a new Hook with a connection to the database using the given DSN.
-func New(ctx context.Context, dsn string) (*Hook, error) {
-	conn, err := pgx.Connect(ctx, dsn)
-	if err != nil {
-		return nil, err
-	}
-
-	return NewWithConn(conn), nil
+type Hook struct {
+	pool     *pgxpool.Pool
+	handlers map[TableOp][]Handler
+	mu       sync.Mutex
 }
 
-// NewWithPool creates a new Hook with the given connection pool.
-func NewWithConn(conn *pgx.Conn) *Hook {
-	return &Hook{
-		conn:     conn,
-		handlers: make(map[TableOp][]Handler),
-	}
+type TableOp struct {
+	Table string `json:"table"`
+	Op    Op     `json:"op"`
+}
+
+type Payload struct {
+	Op     Op             `json:"op"`
+	Schema string         `json:"schema"`
+	Table  string         `json:"table"`
+	Row    map[string]any `json:"row"`
+	OldRow map[string]any `json:"old_row"`
+}
+
+// New creates a new Hook with a connection to the database using the given DSN.
+func New(pool *pgxpool.Pool) (*Hook, error) {
+	return &Hook{pool: pool, handlers: make(map[TableOp][]Handler)}, nil
 }
 
 // Hook adds a new handler for the given table and operation.
@@ -105,13 +86,20 @@ func (h *Hook) Listen(ctx context.Context) error {
 		}
 	}
 
-	if _, err := h.conn.Exec(ctx, "LISTEN hooks"); err != nil {
+	if _, err := h.pool.Exec(ctx, "LISTEN hooks"); err != nil {
 		return fmt.Errorf("failed to listen to hooks: %w", err)
 	}
 
 	log.Println("Listening for notifications...")
+
+	conn, err := h.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("acquire connection: %w", err)
+	}
+	defer conn.Release()
+
 	for {
-		notification, err := h.conn.WaitForNotification(ctx)
+		notification, err := conn.Conn().WaitForNotification(ctx)
 		if err != nil {
 			return err
 		}
@@ -139,11 +127,6 @@ func (h *Hook) Listen(ctx context.Context) error {
 			}
 		}()
 	}
-}
-
-// Close closes the connection pool.
-func (h *Hook) Close(ctx context.Context) {
-	h.conn.Close(ctx)
 }
 
 // Handler is an interface that handles a payload.
@@ -177,7 +160,7 @@ func (h *Hook) CreateFunction(ctx context.Context) error {
 		END;
 		$$ LANGUAGE plpgsql;
 	`
-	if _, err := h.conn.Exec(ctx, query); err != nil {
+	if _, err := h.pool.Exec(ctx, query); err != nil {
 		return err
 	}
 
@@ -192,7 +175,7 @@ func (h *Hook) CreateTrigger(ctx context.Context, table string, op Op) error {
 		FOR EACH ROW
 		EXECUTE PROCEDURE notify_hooks();
 	`
-	if _, err := h.conn.Exec(ctx, query); err != nil {
+	if _, err := h.pool.Exec(ctx, query); err != nil {
 		return err
 	}
 
