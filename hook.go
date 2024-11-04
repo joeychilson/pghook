@@ -11,6 +11,13 @@ import (
 	"github.com/joeychilson/pgmq"
 )
 
+const (
+	defaultEventQueueName      = "pghook_events"
+	defaultVisibilityTimeout   = 30 * time.Second
+	defaultPollIntervalDefault = 10 * time.Second
+	defaultPollTimeoutDefault  = 5 * time.Second
+)
+
 type op string
 
 const (
@@ -98,10 +105,10 @@ type Hook[T any] struct {
 func New[T any](querier pgmq.Querier, opts ...Option) *Hook[T] {
 	config := &config{
 		logger:            slog.Default(),
-		eventQueueName:    "pghook_events",
-		visibilityTimeout: pgmq.VisibilityTimeoutDefault,
-		pollInterval:      pgmq.PollIntervalDefault,
-		pollTimeout:       pgmq.PollTimeoutDefault,
+		eventQueueName:    defaultEventQueueName,
+		visibilityTimeout: defaultVisibilityTimeout,
+		pollInterval:      defaultPollIntervalDefault,
+		pollTimeout:       defaultPollTimeoutDefault,
 	}
 	for _, opt := range opts {
 		opt(config)
