@@ -18,15 +18,23 @@ const (
 	defaultPollTimeout       = 250 * time.Millisecond
 )
 
+type op string
+
+const (
+	opInsert op = "INSERT"
+	opUpdate op = "UPDATE"
+	opDelete op = "DELETE"
+)
+
 type eventHandler[T any] struct {
-	op      string
+	op      op
 	table   string
 	handler func(context.Context, any) error
 }
 
 type baseEvent struct {
 	ID    int    `json:"id"`
-	Op    string `json:"op"`
+	Op    op     `json:"op"`
 	Table string `json:"table"`
 }
 
@@ -80,7 +88,7 @@ func (h *Hook[T]) OnInsert(table string, handler func(context.Context, InsertEve
 	defer h.mu.Unlock()
 
 	h.handlers = append(h.handlers, eventHandler[T]{
-		op:      "INSERT",
+		op:      opInsert,
 		table:   table,
 		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(InsertEvent[T])) },
 	})
@@ -92,7 +100,7 @@ func (h *Hook[T]) OnUpdate(table string, handler func(context.Context, UpdateEve
 	defer h.mu.Unlock()
 
 	h.handlers = append(h.handlers, eventHandler[T]{
-		op:      "UPDATE",
+		op:      opUpdate,
 		table:   table,
 		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(UpdateEvent[T])) },
 	})
@@ -104,7 +112,7 @@ func (h *Hook[T]) OnDelete(table string, handler func(context.Context, DeleteEve
 	defer h.mu.Unlock()
 
 	h.handlers = append(h.handlers, eventHandler[T]{
-		op:      "DELETE",
+		op:      opDelete,
 		table:   table,
 		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(DeleteEvent[T])) },
 	})
@@ -167,19 +175,19 @@ func (h *Hook[T]) handleEvent(ctx context.Context, rawEvent json.RawMessage) err
 
 	var event any
 	switch base.Op {
-	case "INSERT":
+	case opInsert:
 		var e InsertEvent[T]
 		if err := json.Unmarshal(rawEvent, &e); err != nil {
 			return fmt.Errorf("unmarshal insert event failed: %w", err)
 		}
 		event = e
-	case "UPDATE":
+	case opUpdate:
 		var e UpdateEvent[T]
 		if err := json.Unmarshal(rawEvent, &e); err != nil {
 			return fmt.Errorf("unmarshal update event failed: %w", err)
 		}
 		event = e
-	case "DELETE":
+	case opDelete:
 		var e DeleteEvent[T]
 		if err := json.Unmarshal(rawEvent, &e); err != nil {
 			return fmt.Errorf("unmarshal delete event failed: %w", err)
@@ -200,7 +208,7 @@ func (h *Hook[T]) handleEvent(ctx context.Context, rawEvent json.RawMessage) err
 }
 
 func (h *Hook[T]) createTriggerFunction(ctx context.Context) error {
-	query := `
+	query := fmt.Sprintf(`
 		CREATE OR REPLACE FUNCTION pghook.notify()
 		RETURNS trigger AS $$
 		DECLARE
@@ -227,12 +235,12 @@ func (h *Hook[T]) createTriggerFunction(ctx context.Context) error {
 				);
 			END IF;
 			
-			PERFORM pgmq.send('pghook_events', payload);
+			PERFORM pgmq.send('%s', payload);
 			
 			RETURN NULL;
 		END;
 		$$ LANGUAGE plpgsql;
-	`
+	`, defaultQueueName)
 	if _, err := h.querier.Exec(ctx, query); err != nil {
 		return fmt.Errorf("create trigger function failed: %w", err)
 	}
