@@ -1,12 +1,6 @@
 # pghook
 
-A Go library for listening to PostgreSQL notifications and executing hooks on insert, update, and delete events.
-
-## Features
-
-- [x] Type-safe hooks
-- [x] Execute hooks on insert, update, and delete events
-- [x] Recover from downtime
+A Go library for executing hooks on insert, update, and delete events in PostgreSQL.
 
 ## Installation
 
