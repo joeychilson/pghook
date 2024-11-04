@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -26,6 +27,10 @@ import (
 
 func main() {
 	ctx := context.Background()
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
 
 	pool, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
 	if err != nil {
@@ -38,7 +43,7 @@ func main() {
 		CreatedAt string `json:"created_at"`
 	}
 
-	hook := pghook.New[User](pool)
+	hook := pghook.New[User](pool, pghook.WithLogger(logger))
 	if err != nil {
 		log.Fatal(err)
 	}
