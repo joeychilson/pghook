@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -243,7 +244,7 @@ func (h *Hook[T]) processPayload(ctx context.Context, rawPayload json.RawMessage
 
 func (h *Hook[T]) createNotificationFunction(ctx context.Context) error {
 	query := fmt.Sprintf(`
-		CREATE OR REPLACE FUNCTION pghook.notify()
+		CREATE OR REPLACE FUNCTION pghook.%[1]s_notify()
 		RETURNS trigger AS $$
 		DECLARE
 			payload jsonb;
@@ -269,7 +270,7 @@ func (h *Hook[T]) createNotificationFunction(ctx context.Context) error {
 				);
 			END IF;
 			
-			PERFORM pgmq.send('%s', payload);
+			PERFORM pgmq.send('%[1]s', payload);
 			
 			RETURN NULL;
 		END;
@@ -283,13 +284,16 @@ func (h *Hook[T]) createNotificationFunction(ctx context.Context) error {
 }
 
 func (h *Hook[T]) createTableTrigger(ctx context.Context, table string) error {
+	name := fmt.Sprintf("pghook_%s", strings.ReplaceAll(table, ".", "_"))
+
 	query := fmt.Sprintf(`
-		CREATE OR REPLACE TRIGGER pghook_%s AFTER INSERT OR UPDATE OR DELETE ON %s
-		FOR EACH ROW EXECUTE PROCEDURE pghook.notify();
-    `, table, table)
+		CREATE OR REPLACE TRIGGER %s AFTER INSERT OR UPDATE OR DELETE ON %s
+		FOR EACH ROW EXECUTE PROCEDURE pghook.%s_notify();
+    `, name, table, h.config.eventQueueName)
+
 	if _, err := h.querier.Exec(ctx, query); err != nil {
 		return fmt.Errorf("create trigger failed: %w", err)
 	}
-	h.config.logger.Debug("created trigger", "name", fmt.Sprintf("pghook_%s", table), "table", table)
+	h.config.logger.Debug("created trigger", "name", name, "table", table)
 	return nil
 }
