@@ -11,13 +11,6 @@ import (
 	"github.com/joeychilson/pgmq"
 )
 
-const (
-	defaultEventQueueName    = "pghook_events"
-	defaultVisibilityTimeout = 30 * time.Second
-	defaultPollInterval      = 5 * time.Second
-	defaultPollTimeout       = 250 * time.Millisecond
-)
-
 type op string
 
 const (
@@ -57,29 +50,63 @@ type DeletePayload[T any] struct {
 	Row *T `json:"row"`
 }
 
+type config struct {
+	logger            *slog.Logger
+	eventQueueName    string
+	visibilityTimeout time.Duration
+	pollInterval      time.Duration
+	pollTimeout       time.Duration
+}
+
 // Option defines a function type for configuring a Hook instance
-type Option func(*Hook[any])
+type Option func(*config)
 
 // WithLogger sets a custom logger for the Hook instance
 func WithLogger(logger *slog.Logger) Option {
-	return func(h *Hook[any]) { h.logger = logger }
+	return func(c *config) { c.logger = logger }
+}
+
+// WithEventQueueName sets the name of the event queue
+func WithEventQueueName(name string) Option {
+	return func(c *config) { c.eventQueueName = name }
+}
+
+// WithVisibilityTimeout sets the visibility timeout for messages in the event queue
+func WithVisibilityTimeout(timeout time.Duration) Option {
+	return func(c *config) { c.visibilityTimeout = timeout }
+}
+
+// WithPollInterval sets the polling interval for reading messages from the event queue
+func WithPollInterval(interval time.Duration) Option {
+	return func(c *config) { c.pollInterval = interval }
+}
+
+// WithPollTimeout sets the polling timeout for reading messages from the event queue
+func WithPollTimeout(timeout time.Duration) Option {
+	return func(c *config) { c.pollTimeout = timeout }
 }
 
 // Hook manages PostgreSQL triggers and message queue-based notifications for table changes
 type Hook[T any] struct {
 	querier       pgmq.Querier
-	logger        *slog.Logger
+	config        *config
 	eventHandlers []eventHandler[T]
 	mutex         sync.RWMutex
 }
 
 // New creates a new Hook instance with the provided database querier and options
 func New[T any](querier pgmq.Querier, opts ...Option) *Hook[T] {
-	hookConfig := &Hook[any]{querier: querier, logger: slog.Default()}
-	for _, opt := range opts {
-		opt(hookConfig)
+	config := &config{
+		logger:            slog.Default(),
+		eventQueueName:    "pghook_events",
+		visibilityTimeout: pgmq.VisibilityTimeoutDefault,
+		pollInterval:      pgmq.PollIntervalDefault,
+		pollTimeout:       pgmq.PollTimeoutDefault,
 	}
-	return &Hook[T]{querier: hookConfig.querier, logger: hookConfig.logger}
+	for _, opt := range opts {
+		opt(config)
+	}
+	return &Hook[T]{querier: querier, config: config}
 }
 
 // OnInsert registers a handler function for INSERT operations on the specified table
@@ -120,7 +147,7 @@ func (h *Hook[T]) OnDelete(table string, handler func(context.Context, DeletePay
 
 // Listen begins processing database events and dispatching them to registered handlers.
 func (h *Hook[T]) Listen(ctx context.Context) error {
-	queue, err := pgmq.New[json.RawMessage](ctx, h.querier, defaultEventQueueName)
+	queue, err := pgmq.New[json.RawMessage](ctx, h.querier, h.config.eventQueueName)
 	if err != nil {
 		return fmt.Errorf("failed to create queue: %w", err)
 	}
@@ -139,29 +166,29 @@ func (h *Hook[T]) Listen(ctx context.Context) error {
 		}
 	}
 
-	h.logger.Info("listening for events...")
+	h.config.logger.Info("listening for events...")
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
-			msg, err := queue.ReadWithPoll(ctx, defaultVisibilityTimeout, defaultPollInterval, defaultPollTimeout)
+			msg, err := queue.ReadWithPoll(ctx, h.config.visibilityTimeout, h.config.pollInterval, h.config.pollTimeout)
 			if err != nil {
-				h.logger.Error("failed to read message", "error", err)
+				h.config.logger.Error("failed to read message", "error", err)
 				continue
 			}
 			if msg == nil {
-				h.logger.Debug("no messages in queue")
+				h.config.logger.Debug("no messages in queue")
 				continue
 			}
 
 			if err := h.processPayload(ctx, msg.Message); err != nil {
-				h.logger.Error("failed to process payload", "error", err)
+				h.config.logger.Error("failed to process payload", "error", err)
 				continue
 			}
 
 			if err := queue.Delete(ctx, msg.ID); err != nil {
-				h.logger.Error("failed to delete message", "error", err)
+				h.config.logger.Error("failed to delete message", "error", err)
 			}
 		}
 	}
@@ -240,11 +267,11 @@ func (h *Hook[T]) createNotificationFunction(ctx context.Context) error {
 			RETURN NULL;
 		END;
 		$$ LANGUAGE plpgsql;
-	`, defaultEventQueueName)
+	`, h.config.eventQueueName)
 	if _, err := h.querier.Exec(ctx, query); err != nil {
 		return fmt.Errorf("create trigger function failed: %w", err)
 	}
-	h.logger.Debug("created trigger function pghook.notify")
+	h.config.logger.Debug("created trigger function pghook.notify")
 	return nil
 }
 
@@ -256,6 +283,6 @@ func (h *Hook[T]) createTableTrigger(ctx context.Context, table string) error {
 	if _, err := h.querier.Exec(ctx, query); err != nil {
 		return fmt.Errorf("create trigger failed: %w", err)
 	}
-	h.logger.Debug("created trigger", "name", fmt.Sprintf("pghook_%s", table), "table", table)
+	h.config.logger.Debug("created trigger", "name", fmt.Sprintf("pghook_%s", table), "table", table)
 	return nil
 }
