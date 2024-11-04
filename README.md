@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -34,11 +33,9 @@ func main() {
 	}
 
 	type User struct {
-		ID        int       `json:"id"`
-		Name      string    `json:"name"`
-		Email     string    `json:"email"`
-		CreatedAt time.Time `json:"created_at"`
-		UpdatedAt time.Time `json:"updated_at"`
+		ID        int    `json:"id"`
+		Name      string `json:"name"`
+		CreatedAt string `json:"created_at"`
 	}
 
 	hook := pghook.New[User](pool)
@@ -46,17 +43,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	hook.OnInsert("users", func(ctx context.Context, e pghook.InsertEvent[User]) error {
+	hook.OnInsert("users", func(ctx context.Context, e pghook.InsertPayload[User]) error {
 		fmt.Println("inserted", e.Row)
 		return nil
 	})
 
-	hook.OnUpdate("users", func(ctx context.Context, e pghook.UpdateEvent[User]) error {
+	hook.OnUpdate("users", func(ctx context.Context, e pghook.UpdatePayload[User]) error {
 		fmt.Println("updated", e.OldRow, e.NewRow)
 		return nil
 	})
 
-	hook.OnDelete("users", func(ctx context.Context, e pghook.DeleteEvent[User]) error {
+	hook.OnDelete("users", func(ctx context.Context, e pghook.DeletePayload[User]) error {
 		fmt.Println("deleted", e.Row)
 		return nil
 	})

@@ -12,7 +12,7 @@ import (
 )
 
 const (
-	defaultQueueName         = "pghook_events"
+	defaultEventQueueName    = "pghook_events"
 	defaultVisibilityTimeout = 30 * time.Second
 	defaultPollInterval      = 5 * time.Second
 	defaultPollTimeout       = 250 * time.Millisecond
@@ -38,89 +38,89 @@ type baseEvent struct {
 	Table string `json:"table"`
 }
 
-// InsertEvent represents an INSERT operation event
-type InsertEvent[T any] struct {
+// InsertPayload represents a database insert operation event with the new row data
+type InsertPayload[T any] struct {
 	baseEvent
-	Row T `json:"row"`
+	Row *T `json:"row"`
 }
 
-// UpdateEvent represents an UPDATE operation event
-type UpdateEvent[T any] struct {
+// DeletePayload represents a database delete operation event with the deleted row data
+type UpdatePayload[T any] struct {
 	baseEvent
-	OldRow T `json:"old_row"`
-	NewRow T `json:"new_row"`
+	OldRow *T `json:"old_row"`
+	NewRow *T `json:"new_row"`
 }
 
-// DeleteEvent represents a DELETE operation event
-type DeleteEvent[T any] struct {
+// DeletePayload represents a DELETE operation payload
+type DeletePayload[T any] struct {
 	baseEvent
-	Row T `json:"row"`
+	Row *T `json:"row"`
 }
 
-// Option is a function that configures a Hook
+// Option defines a function type for configuring a Hook instance
 type Option func(*Hook[any])
 
-// WithLogger sets the logger for the Hook
+// WithLogger sets a custom logger for the Hook instance
 func WithLogger(logger *slog.Logger) Option {
 	return func(h *Hook[any]) { h.logger = logger }
 }
 
-// Hook manages PostgreSQL triggers and notifications for table changes
+// Hook manages PostgreSQL triggers and message queue-based notifications for table changes
 type Hook[T any] struct {
-	querier  pgmq.Querier
-	logger   *slog.Logger
-	handlers []eventHandler[T]
-	mu       sync.RWMutex
+	querier       pgmq.Querier
+	logger        *slog.Logger
+	eventHandlers []eventHandler[T]
+	mutex         sync.RWMutex
 }
 
-// New creates a new Hook with the given configuration
+// New creates a new Hook instance with the provided database querier and options
 func New[T any](querier pgmq.Querier, opts ...Option) *Hook[T] {
-	tempHook := &Hook[any]{querier: querier, logger: slog.Default()}
+	hookConfig := &Hook[any]{querier: querier, logger: slog.Default()}
 	for _, opt := range opts {
-		opt(tempHook)
+		opt(hookConfig)
 	}
-	return &Hook[T]{querier: tempHook.querier, logger: tempHook.logger}
+	return &Hook[T]{querier: hookConfig.querier, logger: hookConfig.logger}
 }
 
-// OnInsert adds a new handler for the INSERT operation on the given table.
-func (h *Hook[T]) OnInsert(table string, handler func(context.Context, InsertEvent[T]) error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+// OnInsert registers a handler function for INSERT operations on the specified table
+func (h *Hook[T]) OnInsert(table string, handler func(context.Context, InsertPayload[T]) error) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
 
-	h.handlers = append(h.handlers, eventHandler[T]{
+	h.eventHandlers = append(h.eventHandlers, eventHandler[T]{
 		op:      opInsert,
 		table:   table,
-		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(InsertEvent[T])) },
+		handler: func(ctx context.Context, p any) error { return handler(ctx, p.(InsertPayload[T])) },
 	})
 }
 
-// OnUpdate adds a new handler for the UPDATE operation on the given table.
-func (h *Hook[T]) OnUpdate(table string, handler func(context.Context, UpdateEvent[T]) error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+// OnUpdate registers a handler function for UPDATE operations on the specified table
+func (h *Hook[T]) OnUpdate(table string, handler func(context.Context, UpdatePayload[T]) error) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
 
-	h.handlers = append(h.handlers, eventHandler[T]{
+	h.eventHandlers = append(h.eventHandlers, eventHandler[T]{
 		op:      opUpdate,
 		table:   table,
-		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(UpdateEvent[T])) },
+		handler: func(ctx context.Context, p any) error { return handler(ctx, p.(UpdatePayload[T])) },
 	})
 }
 
-// OnDelete adds a new handler for the DELETE operation on the given table.
-func (h *Hook[T]) OnDelete(table string, handler func(context.Context, DeleteEvent[T]) error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+// OnDelete registers a handler function for DELETE operations on the specified table
+func (h *Hook[T]) OnDelete(table string, handler func(context.Context, DeletePayload[T]) error) {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
 
-	h.handlers = append(h.handlers, eventHandler[T]{
+	h.eventHandlers = append(h.eventHandlers, eventHandler[T]{
 		op:      opDelete,
 		table:   table,
-		handler: func(ctx context.Context, e any) error { return handler(ctx, e.(DeleteEvent[T])) },
+		handler: func(ctx context.Context, p any) error { return handler(ctx, p.(DeletePayload[T])) },
 	})
 }
 
-// Listen starts listening for notifications and handles them with registered handlers
+// Listen begins processing database events and dispatching them to registered handlers.
 func (h *Hook[T]) Listen(ctx context.Context) error {
-	queue, err := pgmq.New[json.RawMessage](ctx, h.querier, defaultQueueName)
+	queue, err := pgmq.New[json.RawMessage](ctx, h.querier, defaultEventQueueName)
 	if err != nil {
 		return fmt.Errorf("failed to create queue: %w", err)
 	}
@@ -129,12 +129,12 @@ func (h *Hook[T]) Listen(ctx context.Context) error {
 		return fmt.Errorf("failed to create queue: %w", err)
 	}
 
-	if err := h.createTriggerFunction(ctx); err != nil {
+	if err := h.createNotificationFunction(ctx); err != nil {
 		return fmt.Errorf("failed to create trigger function: %w", err)
 	}
 
-	for _, handler := range h.handlers {
-		if err := h.createTrigger(ctx, handler.table); err != nil {
+	for _, handler := range h.eventHandlers {
+		if err := h.createTableTrigger(ctx, handler.table); err != nil {
 			return fmt.Errorf("failed to create trigger: %w", err)
 		}
 	}
@@ -155,8 +155,8 @@ func (h *Hook[T]) Listen(ctx context.Context) error {
 				continue
 			}
 
-			if err := h.handleEvent(ctx, msg.Message); err != nil {
-				h.logger.Error("failed to handle event", "error", err)
+			if err := h.processPayload(ctx, msg.Message); err != nil {
+				h.logger.Error("failed to process payload", "error", err)
 				continue
 			}
 
@@ -167,39 +167,39 @@ func (h *Hook[T]) Listen(ctx context.Context) error {
 	}
 }
 
-func (h *Hook[T]) handleEvent(ctx context.Context, rawEvent json.RawMessage) error {
+func (h *Hook[T]) processPayload(ctx context.Context, rawPayload json.RawMessage) error {
 	var base baseEvent
-	if err := json.Unmarshal(rawEvent, &base); err != nil {
-		return fmt.Errorf("unmarshal base event failed: %w", err)
+	if err := json.Unmarshal(rawPayload, &base); err != nil {
+		return fmt.Errorf("unmarshal base payload failed: %w", err)
 	}
 
-	var event any
+	var payload any
 	switch base.Op {
 	case opInsert:
-		var e InsertEvent[T]
-		if err := json.Unmarshal(rawEvent, &e); err != nil {
-			return fmt.Errorf("unmarshal insert event failed: %w", err)
+		var p InsertPayload[T]
+		if err := json.Unmarshal(rawPayload, &p); err != nil {
+			return fmt.Errorf("unmarshal insert payload failed: %w", err)
 		}
-		event = e
+		payload = p
 	case opUpdate:
-		var e UpdateEvent[T]
-		if err := json.Unmarshal(rawEvent, &e); err != nil {
-			return fmt.Errorf("unmarshal update event failed: %w", err)
+		var p UpdatePayload[T]
+		if err := json.Unmarshal(rawPayload, &p); err != nil {
+			return fmt.Errorf("unmarshal update payload failed: %w", err)
 		}
-		event = e
+		payload = p
 	case opDelete:
-		var e DeleteEvent[T]
-		if err := json.Unmarshal(rawEvent, &e); err != nil {
-			return fmt.Errorf("unmarshal delete event failed: %w", err)
+		var p DeletePayload[T]
+		if err := json.Unmarshal(rawPayload, &p); err != nil {
+			return fmt.Errorf("unmarshal delete payload failed: %w", err)
 		}
-		event = e
+		payload = p
 	default:
 		return fmt.Errorf("unsupported operation: %s", base.Op)
 	}
 
-	for _, handler := range h.handlers {
+	for _, handler := range h.eventHandlers {
 		if handler.table == base.Table && handler.op == base.Op {
-			if err := handler.handler(ctx, event); err != nil {
+			if err := handler.handler(ctx, payload); err != nil {
 				return fmt.Errorf("handler failed: %w", err)
 			}
 		}
@@ -207,7 +207,7 @@ func (h *Hook[T]) handleEvent(ctx context.Context, rawEvent json.RawMessage) err
 	return nil
 }
 
-func (h *Hook[T]) createTriggerFunction(ctx context.Context) error {
+func (h *Hook[T]) createNotificationFunction(ctx context.Context) error {
 	query := fmt.Sprintf(`
 		CREATE OR REPLACE FUNCTION pghook.notify()
 		RETURNS trigger AS $$
@@ -240,15 +240,15 @@ func (h *Hook[T]) createTriggerFunction(ctx context.Context) error {
 			RETURN NULL;
 		END;
 		$$ LANGUAGE plpgsql;
-	`, defaultQueueName)
+	`, defaultEventQueueName)
 	if _, err := h.querier.Exec(ctx, query); err != nil {
 		return fmt.Errorf("create trigger function failed: %w", err)
 	}
-	h.logger.Debug("created trigger function")
+	h.logger.Debug("created trigger function pghook.notify")
 	return nil
 }
 
-func (h *Hook[T]) createTrigger(ctx context.Context, table string) error {
+func (h *Hook[T]) createTableTrigger(ctx context.Context, table string) error {
 	query := fmt.Sprintf(`
 		CREATE OR REPLACE TRIGGER pghook_%s AFTER INSERT OR UPDATE OR DELETE ON %s
 		FOR EACH ROW EXECUTE PROCEDURE pghook.notify();
